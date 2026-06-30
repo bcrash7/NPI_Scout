@@ -787,7 +787,8 @@ def find_current_info_via_web(prof: ProviderProfile, want_location: bool = True,
         "You are researching one specific U.S. physician. Use web search to find the most current, "
         "authoritative PUBLIC information about THIS exact person (match the NPI, full name, and "
         "specialty; ignore same-named others).",
-        f"- Name: {name}", f"- NPI: {prof.npi}", f"- Specialty: {spec or 'unknown'}",
+        f"- Name: {name or 'UNKNOWN — identify the provider from the NPI'}",
+        f"- NPI: {prof.npi}", f"- Specialty: {spec or 'unknown'}",
         f"- Employer/group on file (CMS, may help): {org or 'unknown'}",
         f"- Address on file with NPPES (OFTEN OUT OF DATE — do not trust it): {nppes_line}",
         "",
@@ -795,10 +796,12 @@ def find_current_info_via_web(prof: ProviderProfile, want_location: bool = True,
     schema = []
     if want_location:
         parts.append(
-            "TASK A — CURRENT PRACTICE LOCATION: find where this physician practices NOW. Prefer "
-            "the employer/health-system official 'find a doctor' profile or the practice's own "
-            "site; ignore outdated listings. Never guess an address.")
+            "TASK A — IDENTITY & CURRENT PRACTICE LOCATION: confirm the provider's full name (look "
+            "it up from the NPI if it is unknown above) and find where this physician practices "
+            "NOW. Prefer the employer/health-system official 'find a doctor' profile or the "
+            "practice's own site; ignore outdated listings. Never guess an address.")
         schema.append(
+            '"provider_name": <full name or null>, "provider_credential": <e.g. MD/DO or null>, '
             '"current_employer": <string or null>, "website": <official current practice/profile '
             'URL or null>, "offices": [{"line1":..,"line2":.. or null,"city":..,"state":<2-letter>,'
             '"postal":..,"phone":.. or null}], "confidence": "high"|"medium"|"low", '
@@ -842,6 +845,21 @@ def find_current_info_via_web(prof: ProviderProfile, want_location: bool = True,
         evidence = [str(u).strip() for u in (data.get("evidence_urls") or []) if str(u).strip()][:6]
         prof.web_confidence = conf
         prof.web_evidence = evidence
+        # Identity fallback: if NPPES and CMS gave no name, accept the web-confirmed name (only
+        # when the search is reasonably confident and cites a source, so we don't invent a person).
+        if not prof.first_name and not prof.last_name and conf in ("high", "medium") and evidence:
+            wn = re.sub(r"\s+", " ", str(data.get("provider_name") or "").strip())
+            wn = re.sub(r",?\s*(MD|DO|MBBS|NP|PA|DPM|DDS|DMD|PhD)\b.*$", "", wn, flags=re.I).strip()
+            toks = [t for t in wn.split(" ") if t]
+            if len(toks) >= 2:
+                prof.last_name = toks[-1]
+                prof.first_name = " ".join(toks[:-1])
+                if not prof.credential:
+                    prof.credential = str(data.get("provider_credential") or "").strip()
+                prof.sources_used.append("Open web search (provider identity)")
+                prof.notes.append(f"Provider identified via open web search as {prof.full_name}"
+                                  f"{(' ' + prof.credential) if prof.credential else ''} "
+                                  f"(NPPES returned no name); confidence {conf}.")
         emp = str(data.get("current_employer") or "").strip()
         if emp and emp.lower() not in ("none", "null", "n/a", "unknown"):
             prof.web_current_employer = emp
@@ -1087,6 +1105,16 @@ def fetch_cms_medicare(npi: str, prof: ProviderProfile, override_uuid: str = "")
     prof.sources_used.append("CMS Medicare Physician & Other Practitioners")
     prof.medicare_data_year = year
 
+    # Name fallback (in case NPPES and DAC both came up empty for this valid NPI).
+    if not prof.last_name:
+        prof.last_name = str(row.get("Rndrng_Prvdr_Last_Org_Name", "") or "").strip()
+    if not prof.first_name:
+        prof.first_name = str(row.get("Rndrng_Prvdr_First_Name", "") or "").strip()
+    if not prof.credential:
+        prof.credential = str(row.get("Rndrng_Prvdr_Crdntls", "") or "").strip()
+    if not prof.gender:
+        prof.gender = str(row.get("Rndrng_Prvdr_Gndr", "") or "").strip()
+
     def _num(*keys, cast=float):
         for k in keys:
             if k in row and str(row[k]).strip() not in ("", "None"):
@@ -1148,6 +1176,19 @@ def fetch_doctors_and_clinicians(npi: str, prof: ProviderProfile) -> None:
         return
     row = next((r for r in rows if str(r.get("NPI", r.get("npi", ""))).strip() == str(npi)), rows[0])
     prof.sources_used.append("CMS Doctors & Clinicians National Downloadable File")
+
+    # Name fallback: NPPES occasionally returns no usable record for a valid NPI. DAC carries the
+    # provider's name, so fill anything NPPES left blank rather than aborting with a blank report.
+    if not prof.last_name:
+        prof.last_name = _row_get(row, "Provider Last Name", "lst_nm", "Last Name")
+    if not prof.first_name:
+        prof.first_name = _row_get(row, "Provider First Name", "frst_nm", "First Name")
+    if not prof.middle_name:
+        prof.middle_name = _row_get(row, "Provider Middle Name", "mid_nm")
+    if not prof.credential:
+        prof.credential = _row_get(row, "Provider Credential Text", "Cred", "cred")
+    if not prof.gender:
+        prof.gender = _row_get(row, "gndr", "Gender")
 
     grd = _row_get(row, "Grd_yr", "grd_yr")
     if grd:
@@ -2623,20 +2664,45 @@ def filter_offices_to_locality(prof: ProviderProfile) -> None:
             "historical or affiliated-network addresses). Verify the current office if needed.")
 
 
+def _npi_checksum_valid(npi: str) -> bool:
+    """Validate a 10-digit NPI with the ISO/IEC 7812 Luhn check (prefix 80840). Catches typos
+    and fabricated numbers so we can give a precise message instead of a blank report."""
+    s = re.sub(r"\D", "", str(npi or ""))
+    if len(s) != 10:
+        return False
+    base = "80840" + s[:9]
+    total = 0
+    for i, ch in enumerate(reversed(base)):
+        d = int(ch)
+        if i % 2 == 0:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return (10 - (total % 10)) % 10 == int(s[9])
+
+
 def research_npi(npi: str, *, cms_uuid: str = "", do_google: bool = True,
                  do_scrape: bool = True, do_aggregators: bool = True,
                  do_photos: bool = True, do_web: bool = True,
                  do_interests: bool = True) -> ProviderProfile:
     npi = re.sub(r"\D", "", str(npi))
     prof = ProviderProfile(npi=npi, retrieved_at=dt.datetime.now().isoformat(timespec="seconds"))
-    if len(npi) != 10:
-        prof.notes.append("Invalid NPI: must be 10 digits.")
+    if not _npi_checksum_valid(npi):
+        prof.notes.append("Not a valid NPI number: it must be 10 digits and pass the NPI "
+                          "checksum. Double-check the number." if len(npi) == 10 else
+                          "Not a valid NPI: must be exactly 10 digits.")
         return prof
 
     print(f"[{npi}] NPPES ...")
     fetch_nppes(npi, prof)
     if not prof.full_name:
-        return prof
+        # NPPES sometimes returns nothing for a VALID NPI (deactivated, withheld, or a transient
+        # API gap). NPPES is unreliable, so we do NOT abort — CMS and the open web search below
+        # usually still identify the provider and build a useful report.
+        prof.notes.append("No active NPPES record was returned for this valid NPI (it may be "
+                          "deactivated/withheld, or NPPES was briefly unavailable). Continuing "
+                          "with CMS and open-web sources to identify the provider.")
     print(f"[{npi}] Affiliated org locations ...")
     fetch_affiliated_org_locations(prof)
     dedupe_addresses(prof)
@@ -2797,7 +2863,8 @@ def write_html(prof: ProviderProfile, outdir: str) -> str:
     if lead_photo:
         P.append(f"<figure class='headshot'><img src='{lead_photo[1]}' alt='{_esc(lead_photo[0])}'>"
                  f"<figcaption>{_esc(lead_photo[0])}</figcaption></figure>")
-    P.append(f"<h1>{_esc(prof.full_name)} {_esc(prof.credential)}</h1>")
+    _hdr = (f"{prof.full_name} {prof.credential}").strip() or f"NPI {prof.npi}"
+    P.append(f"<h1>{_esc(_hdr)}</h1>")
     if prof.display_practice_name:
         P.append(f"<p class='sub'><b>Practice:</b> {_esc(prof.display_practice_name)}</p>")
     P.append(f"<p class='sub'>NPI {_esc(prof.npi)} · {_esc(prof.primary_taxonomy)} · "
@@ -3499,7 +3566,13 @@ def main(argv=None):
     open_in_chrome(html)
     print(f"\nDone. Opened report in Chrome:\n  {html}")
     if not prof.full_name:
-        print("  (No NPPES record — check the NPI.)")
+        notes = " ".join(prof.notes).lower()
+        if "not a valid npi" in notes:
+            print("  (That NPI is not valid — check the number.)")
+        else:
+            print("  (Valid NPI, but no provider name could be found in NPPES, CMS, or on the "
+                  "open web. The NPI may be deactivated/withheld. The report shows whatever the "
+                  "other sources returned.)")
 
 
 if __name__ == "__main__":
