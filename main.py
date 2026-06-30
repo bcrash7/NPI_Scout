@@ -69,6 +69,11 @@ LLM_MODEL = os.environ.get("NPI_SCOUT_MODEL", "claude-sonnet-4-6").strip()
 # budget (the website-analysis call then runs uncontended on the primary model). Override with
 # NPI_SCOUT_AUX_MODEL; set it equal to NPI_SCOUT_MODEL to force everything onto one model.
 LLM_MODEL_AUX = os.environ.get("NPI_SCOUT_AUX_MODEL", "claude-haiku-4-5-20251001").strip()
+# Model for the deep hobbies/interests web research. Defaults to the lighter, higher-throughput
+# model (its own per-minute budget) so the search actually COMPLETES on tight rate limits instead
+# of timing out. Set NPI_SCOUT_RESEARCH_MODEL to the primary model if you have ample headroom and
+# want the strongest researcher.
+LLM_MODEL_RESEARCH = os.environ.get("NPI_SCOUT_RESEARCH_MODEL", LLM_MODEL_AUX).strip()
 print(f"[config] Google key: {'detected' if GOOGLE_API_KEY else 'MISSING'}; "
       f"Census key: {'detected' if CENSUS_API_KEY else 'MISSING'}; "
       f"Anthropic key: {'detected' if ANTHROPIC_API_KEY else 'MISSING'}; "
@@ -76,7 +81,7 @@ print(f"[config] Google key: {'detected' if GOOGLE_API_KEY else 'MISSING'}; "
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 ConciergeNPIScout/1.3"
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 NPPES_URL = "https://npiregistry.cms.hhs.gov/api/"
@@ -150,8 +155,9 @@ FIT_WEIGHTS = {
     "career_stage": 25,
     "specialty": 10,
 }
-# Final-score -> triage lane (hard disqualifiers override to DEAD).
-FIT_LANES = [("HOT", 70), ("WARM", 50), ("LATER", 30), ("DEAD", 0)]
+# Final-score -> triage lane (hard disqualifiers override to the lowest grade).
+# A (green) / B (yellow) / C (orange) / D (red).
+FIT_LANES = [("A", 70), ("B", 50), ("C", 30), ("D", 0)]
 
 # ---- Market context: concierge competition & affiliate proximity ----
 # Concierge competitors near a practice. DPC (direct primary care) is intentionally
@@ -241,17 +247,47 @@ _RECOGNITION_PATTERNS = [
 # HTTP helpers
 # ----------------------------------------------------------------------------
 _SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": USER_AGENT})
+_SESSION.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+              "image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+})
+
+# Extra headers a real Chrome sends on a top-level navigation. Some WAFs (e.g. several hospital
+# 'find a doctor' sites) 403 anything missing these, so we retry a blocked HTML fetch with them.
+_BROWSER_NAV_HEADERS = {
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 
 
 def _get(url, *, params=None, headers=None, timeout=25, retries=3, expect="json", quiet=False):
     last_err = None
+    tried_browser = False
     for attempt in range(retries):
         try:
             r = _SESSION.get(url, params=params, headers=headers, timeout=timeout)
             if r.status_code == 429:
                 time.sleep(2 * (attempt + 1))
                 continue
+            # Bot-wall (403/406): many practice/hospital sites block requests that don't look like
+            # a real top-level browser navigation. Retry once with full Chrome nav headers + a
+            # plausible same-origin Referer before giving up.
+            if r.status_code in (403, 406) and expect in ("text", "bytes") and not tried_browser:
+                tried_browser = True
+                from urllib.parse import urlsplit
+                root = "{0.scheme}://{0.netloc}/".format(urlsplit(url))
+                bh = dict(_BROWSER_NAV_HEADERS)
+                bh["Referer"] = root
+                bh.update(headers or {})
+                r = _SESSION.get(url, params=params, headers=bh, timeout=timeout)
             r.raise_for_status()
             if expect == "json":
                 return r.json()
@@ -342,6 +378,7 @@ class Address:
     satellite_data_uri: str = ""
     map_data_uri: str = ""
     map_link: str = ""
+    street_view_link: str = ""
     source: str = "NPPES (individual)"
     mosaic_score: Optional[float] = None
     mosaic_high_value_share: Optional[float] = None
@@ -766,69 +803,48 @@ def apply_current_address(prof: ProviderProfile) -> None:
     prof.notes.append(note)
 
 
-def find_current_info_via_web(prof: ProviderProfile, want_location: bool = True,
-                              want_interests: bool = True) -> None:
-    """One open web search (Anthropic server-side web_search tool) that, in a single pass over the
-    physician's public pages, can establish (a) WHERE they practice NOW — NPPES is frequently
-    years out of date — and (b) PUBLIC, non-clinical rapport facts (hobbies, sports, music,
-    volunteering). Doing both in one call keeps web-search token usage (whole pages are pulled
-    into context) within tight per-minute limits, and it runs on LLM_MODEL_AUX so it doesn't
-    consume the primary model's budget that the website-analysis call needs."""
-    if not ANTHROPIC_API_KEY or not (want_location or want_interests):
+def find_current_practice_via_web(prof: ProviderProfile) -> None:
+    """Open web search (Anthropic server-side web_search) for WHERE the physician practices NOW —
+    independent of NPPES, which is frequently years out of date. Searches name + specialty +
+    current employer/health system + NPI to disambiguate, and prefers the most authoritative
+    current source (the employer's find-a-doctor page or the practice site). Runs on the aux
+    model so it doesn't exhaust the primary model's per-minute token budget."""
+    if not ANTHROPIC_API_KEY:
         return
     name = prof.full_name
     spec = prof.primary_taxonomy or prof.dac_primary_specialty or ""
-    org = (prof.web_current_employer or prof.dac_org_name or prof.affiliated_org_name
-           or prof.organization_name or "").strip()
+    org = (prof.dac_org_name or prof.affiliated_org_name or prof.organization_name or "").strip()
     o = _primary_office(prof)
-    nppes_line = o.one_line() if o else "unknown"
-
-    parts = [
-        "You are researching one specific U.S. physician. Use web search to find the most current, "
-        "authoritative PUBLIC information about THIS exact person (match the NPI, full name, and "
-        "specialty; ignore same-named others).",
-        f"- Name: {name or 'UNKNOWN — identify the provider from the NPI'}",
-        f"- NPI: {prof.npi}", f"- Specialty: {spec or 'unknown'}",
-        f"- Employer/group on file (CMS, may help): {org or 'unknown'}",
-        f"- Address on file with NPPES (OFTEN OUT OF DATE — do not trust it): {nppes_line}",
-        "",
-    ]
-    schema = []
-    if want_location:
-        parts.append(
-            "TASK A — IDENTITY & CURRENT PRACTICE LOCATION: confirm the provider's full name (look "
-            "it up from the NPI if it is unknown above) and find where this physician practices "
-            "NOW. Prefer the employer/health-system official 'find a doctor' profile or the "
-            "practice's own site; ignore outdated listings. Never guess an address.")
-        schema.append(
-            '"provider_name": <full name or null>, "provider_credential": <e.g. MD/DO or null>, '
-            '"current_employer": <string or null>, "website": <official current practice/profile '
-            'URL or null>, "offices": [{"line1":..,"line2":.. or null,"city":..,"state":<2-letter>,'
-            '"postal":..,"phone":.. or null}], "confidence": "high"|"medium"|"low", '
-            '"evidence_urls": [<urls>]')
-    if want_interests:
-        parts.append(
-            "TASK B — PERSONAL INTERESTS (for rapport): find PUBLIC, non-clinical human-interest "
-            "facts — hobbies, sports (marathons, cycling), music (plays in a band), arts/crafts "
-            "(needlepoint, woodworking), volunteering/community work, non-medical awards or press, "
-            "languages. Include an item ONLY if publicly stated and clearly about THIS physician; "
-            "when unsure, omit it. Do NOT include anything sensitive: health, religion, politics, "
-            "sexual orientation, race/ethnicity, family members' private details, home address, or "
-            "finances.")
-        schema.append('"interests": [{"text": <short factual phrase>, "source_url": <url or null>}]')
-    parts.append("\nReply with STRICT JSON ONLY (no markdown, no prose): {" + ", ".join(schema) + "}.")
-    prompt = "\n".join(parts)
-
+    prompt = (
+        f"Find the CURRENT practice location of this U.S. physician. Use web search.\n"
+        f"- Name: {name or 'UNKNOWN — identify the provider from the NPI'}\n"
+        f"- NPI: {prof.npi}\n- Specialty: {spec or 'unknown'}\n"
+        f"- Current employer/group (from CMS, may help): {org or 'unknown'}\n"
+        f"- Address on file with NPPES (OFTEN OUT OF DATE \u2014 do not trust it): "
+        f"{o.one_line() if o else 'unknown'}\n\n"
+        "Confirm the provider's full name (look it up from the NPI if unknown above), then find "
+        "where this exact physician (match the NPI / full name / specialty) practices NOW. Prefer "
+        "the most authoritative, most recent source: the employer or health system's official "
+        "'find a doctor' profile, or the practice's own website. Ignore listings that look "
+        "outdated or refer to a different person with the same name. Then reply with STRICT JSON "
+        "only (no markdown, no prose) of the form: "
+        '{"provider_name": <full name or null>, "provider_credential": <e.g. MD/DO or null>, '
+        '"current_employer": <string or null>, "website": <official current practice/profile URL '
+        'or null>, "offices": [{"line1":..,"line2":.. or null,"city":..,"state":<2-letter>,'
+        '"postal":..,"phone":.. or null}], "confidence": "high"|"medium"|"low", '
+        '"evidence_urls": [<urls you relied on>]}. '
+        "List the primary current office first. If you cannot establish a current location from a "
+        "credible source, return offices: [] and confidence: \"low\". Never guess an address.")
     resp = _post("https://api.anthropic.com/v1/messages",
-                 json_body={"model": LLM_MODEL_AUX, "max_tokens": 1000,
+                 json_body={"model": LLM_MODEL_AUX, "max_tokens": 900,
                             "messages": [{"role": "user", "content": prompt}],
                             "tools": [{"type": "web_search_20250305", "name": "web_search",
-                                       "max_uses": 3}]},
+                                       "max_uses": 2}]},
                  headers={"x-api-key": ANTHROPIC_API_KEY,
                           "anthropic-version": "2023-06-01",
                           "content-type": "application/json"})
     if not resp:
-        prof.notes.append("Open web search was unavailable this run (rate limit or network).")
+        prof.notes.append("Open web search for the current practice address was unavailable this run.")
         return
     try:
         text = "".join(b.get("text", "") for b in resp.get("content", [])
@@ -840,73 +856,61 @@ def find_current_info_via_web(prof: ProviderProfile, want_location: bool = True,
         prof.notes.append("Open web search ran but its result could not be parsed.")
         return
 
-    if want_location:
-        conf = str(data.get("confidence") or "").strip().lower()
-        evidence = [str(u).strip() for u in (data.get("evidence_urls") or []) if str(u).strip()][:6]
-        prof.web_confidence = conf
-        prof.web_evidence = evidence
-        # Identity fallback: if NPPES and CMS gave no name, accept the web-confirmed name (only
-        # when the search is reasonably confident and cites a source, so we don't invent a person).
-        if not prof.first_name and not prof.last_name and conf in ("high", "medium") and evidence:
-            wn = re.sub(r"\s+", " ", str(data.get("provider_name") or "").strip())
-            wn = re.sub(r",?\s*(MD|DO|MBBS|NP|PA|DPM|DDS|DMD|PhD)\b.*$", "", wn, flags=re.I).strip()
-            toks = [t for t in wn.split(" ") if t]
-            if len(toks) >= 2:
-                prof.last_name = toks[-1]
-                prof.first_name = " ".join(toks[:-1])
-                if not prof.credential:
-                    prof.credential = str(data.get("provider_credential") or "").strip()
-                prof.sources_used.append("Open web search (provider identity)")
-                prof.notes.append(f"Provider identified via open web search as {prof.full_name}"
-                                  f"{(' ' + prof.credential) if prof.credential else ''} "
-                                  f"(NPPES returned no name); confidence {conf}.")
-        emp = str(data.get("current_employer") or "").strip()
-        if emp and emp.lower() not in ("none", "null", "n/a", "unknown"):
-            prof.web_current_employer = emp
-        web = str(data.get("website") or "").strip()
-        if web.startswith("http") and not prof.website:
-            prof.website = web
-        offices = []
-        for x in (data.get("offices") or []):
-            if not isinstance(x, dict):
-                continue
-            line1 = str(x.get("line1") or "").strip()
-            city = str(x.get("city") or "").strip()
-            state = str(x.get("state") or "").strip().upper()[:2]
-            postal = str(x.get("postal") or "").strip()
-            if not line1 or not (city or postal):
-                continue
-            offices.append({"line1": line1, "line2": str(x.get("line2") or "").strip(),
-                            "city": city, "state": state, "postal": postal,
-                            "phone": str(x.get("phone") or "").strip()})
-        if offices and conf in ("high", "medium") and evidence:
-            prof.web_offices = offices[:5]
-            prof.sources_used.append("Open web search (current practice)")
-            prof.notes.append(
-                "Open web search located the current practice"
-                + (f" at {prof.web_current_employer}" if prof.web_current_employer else "")
-                + f" ({offices[0].get('city','')}, {offices[0].get('state','')}); "
-                + f"confidence {conf}. Evidence: " + "; ".join(evidence[:3]))
-        elif offices:
-            prof.notes.append("Open web search returned a possible current location but with low "
-                              "confidence or no cited source; not used to override the address.")
+    conf = str(data.get("confidence") or "").strip().lower()
+    evidence = [str(u).strip() for u in (data.get("evidence_urls") or []) if str(u).strip()][:6]
+    prof.web_confidence = conf
+    prof.web_evidence = evidence
+    if not prof.first_name and not prof.last_name and conf in ("high", "medium") and evidence:
+        wn = re.sub(r"\s+", " ", str(data.get("provider_name") or "").strip())
+        wn = re.sub(r",?\s*(MD|DO|MBBS|NP|PA|DPM|DDS|DMD|PhD)\b.*$", "", wn, flags=re.I).strip()
+        toks = [t for t in wn.split(" ") if t]
+        if len(toks) >= 2:
+            prof.last_name = toks[-1]
+            prof.first_name = " ".join(toks[:-1])
+            if not prof.credential:
+                prof.credential = str(data.get("provider_credential") or "").strip()
+            prof.sources_used.append("Open web search (provider identity)")
+            prof.notes.append(f"Provider identified via open web search as {prof.full_name}"
+                              f"{(' ' + prof.credential) if prof.credential else ''} "
+                              f"(NPPES returned no name); confidence {conf}.")
+    emp = str(data.get("current_employer") or "").strip()
+    if emp and emp.lower() not in ("none", "null", "n/a", "unknown"):
+        prof.web_current_employer = emp
+    web = str(data.get("website") or "").strip()
+    if web.startswith("http") and not prof.website:
+        prof.website = web
 
-    if want_interests:
-        items = []
-        for it in (data.get("interests") or []):
-            if isinstance(it, dict) and str(it.get("text") or "").strip():
-                url = str(it.get("source_url") or "").strip()
-                items.append({"text": str(it["text"]).strip(),
-                              "source": url if url.startswith("http") else "open web search"})
-        if _merge_interests(prof, items):
-            prof.sources_used.append("Open web search (personal interests)")
+    offices = []
+    for x in (data.get("offices") or []):
+        if not isinstance(x, dict):
+            continue
+        line1 = str(x.get("line1") or "").strip()
+        city = str(x.get("city") or "").strip()
+        state = str(x.get("state") or "").strip().upper()[:2]
+        postal = str(x.get("postal") or "").strip()
+        if not line1 or not (city or postal):
+            continue
+        offices.append({"line1": line1, "line2": str(x.get("line2") or "").strip(),
+                        "city": city, "state": state, "postal": postal,
+                        "phone": str(x.get("phone") or "").strip()})
+    if offices and conf in ("high", "medium") and evidence:
+        prof.web_offices = offices[:5]
+        prof.sources_used.append("Open web search (current practice)")
+        prof.notes.append(
+            "Open web search located the current practice"
+            + (f" at {prof.web_current_employer}" if prof.web_current_employer else "")
+            + f" ({offices[0].get('city','')}, {offices[0].get('state','')}); "
+            + f"confidence {conf}. Evidence: " + "; ".join(evidence[:3]))
+    elif offices:
+        prof.notes.append("Open web search returned a possible current location but with low "
+                          "confidence or no cited source; not used to override the address.")
 
 
 def _merge_interests(prof: ProviderProfile, items, default_source: str = "") -> int:
-    """Add interest items ({"text","source"}) to the profile, collapsing near-duplicates: if a
-    new item's significant words are a subset of an existing item (or vice versa) they are treated
-    as the same interest, keeping the more detailed phrasing (e.g. 'runs marathons' is absorbed by
-    'Runs marathons (Boston 2023)')."""
+    """Add rapport/background items ({"text","source"}) to the profile, collapsing near-duplicates:
+    if a new item's significant words are a subset of an existing item (or vice versa) they are
+    treated as the same item, keeping the more detailed phrasing (e.g. 'runs marathons' is absorbed
+    by 'Runs marathons (Boston 2023)')."""
     def toks(s):
         return frozenset(t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if len(t) > 2)
     added = 0
@@ -933,6 +937,79 @@ def _merge_interests(prof: ProviderProfile, items, default_source: str = "") -> 
         prof.personal_interests.append({"text": text, "source": src})
         added += 1
     return added
+
+
+def find_personal_interests_via_web(prof: ProviderProfile) -> None:
+    """Open web search for the physician's PERSONAL hobbies and interests for outreach rapport —
+    e.g. fishing, cooking, golf, running, sailing, gardening, music, travel, coaching, pets,
+    languages. PUBLIC facts clearly about this physician only. Deliberately EXCLUDES professional/
+    clinical material (specialties, training, practice ownership, awards, CMS scores, career) and
+    sensitive categories (health, religion, politics, orientation, race, family private details,
+    home address, finances). Runs an EXHAUSTIVE multi-query search on LLM_MODEL_RESEARCH."""
+    if not ANTHROPIC_API_KEY:
+        return
+    name = prof.full_name
+    spec = prof.primary_taxonomy or prof.dac_primary_specialty or ""
+    emp = (prof.web_current_employer or prof.dac_org_name or prof.affiliated_org_name or "").strip()
+    if prof.web_offices:
+        w = prof.web_offices[0]
+        where = f"{w.get('city','')}, {w.get('state','')}".strip(", ")
+    else:
+        o = _primary_office(prof)
+        where = f"{o.city}, {o.state}".strip(", ") if o else ""
+    prompt = (
+        f"You are doing DEEP research on one specific U.S. physician to find their PERSONAL "
+        f"HOBBIES and INTERESTS for sales rapport. Be EXHAUSTIVE and THOROUGH — run several "
+        f"different searches and read the actual pages, don't stop at the first result.\n"
+        f"- Name: {name}\n- NPI: {prof.npi}\n- Specialty: {spec or 'unknown'}\n"
+        f"- Employer/area (to disambiguate from same-named people): {emp or 'unknown'} {where}\n\n"
+        "Search from multiple angles — the doctor's name combined with their city/area, "
+        "\"hobbies\", \"enjoys\", \"in his/her free time\", \"outside the office\", \"interview\", "
+        "and \"profile\" — and read the practice's 'meet the doctor'/'about'/'our team' bio page, "
+        "local news or magazine features, and any personal/community write-ups.\n"
+        "I want ONLY genuine personal-life interests and pastimes. Capture every specific one you "
+        "find, e.g.: fishing, hunting, cooking, golf, boating/sailing, gardening, cycling, "
+        "running/marathons, skiing, tennis, woodworking, painting, photography, playing an "
+        "instrument or being in a band, collecting, travel, coaching youth sports, pets/animals, "
+        "and languages spoken. List each distinct interest as its own short phrase.\n"
+        "DO NOT include anything about their work or professional life — no clinical focus, "
+        "specialties, years in practice, practice ownership, training/medical school/degrees, "
+        "CMS/quality scores, awards, publications, or career history. Those belong elsewhere in "
+        "the report, NOT here. If a source only describes their medical practice, skip it.\n"
+        "Include an item ONLY if it is publicly stated and clearly about THIS exact physician "
+        "(match name + specialty + area); when unsure, leave it out. Also exclude sensitive "
+        "categories: health, religion, politics, sexual orientation, race/ethnicity, family "
+        "members' private details, home address, finances. Reply with STRICT JSON only (no "
+        'markdown): {"interests": [{"text": <short hobby/interest phrase>, "source_url": <url or '
+        'null>}], "notes": <string or null>}. Return interests: [] only if you truly find none.')
+    resp = _post("https://api.anthropic.com/v1/messages",
+                 json_body={"model": LLM_MODEL_RESEARCH, "max_tokens": 1000,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "tools": [{"type": "web_search_20250305", "name": "web_search",
+                                       "max_uses": 4}]},
+                 headers={"x-api-key": ANTHROPIC_API_KEY,
+                          "anthropic-version": "2023-06-01",
+                          "content-type": "application/json"})
+    if not resp:
+        prof.notes.append("Open web search for personal interests was unavailable this run.")
+        return
+    try:
+        text = "".join(b.get("text", "") for b in resp.get("content", [])
+                       if b.get("type") == "text").strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        mm = re.search(r"\{.*\}", text, re.DOTALL)
+        data = json.loads(mm.group(0) if mm else text)
+    except Exception:  # noqa: BLE001
+        prof.notes.append("Open web search for personal interests ran but could not be parsed.")
+        return
+    items = []
+    for it in (data.get("interests") or []):
+        if isinstance(it, dict) and str(it.get("text") or "").strip():
+            url = str(it.get("source_url") or "").strip()
+            items.append({"text": str(it["text"]).strip(),
+                          "source": url if url.startswith("http") else "open web search"})
+    if _merge_interests(prof, items):
+        prof.sources_used.append("Open web search (personal interests)")
 
 
 def fetch_affiliated_org_locations(prof: ProviderProfile) -> None:
@@ -1389,6 +1466,46 @@ def static_map_b64(lat: float, lng: float) -> Optional[str]:
     return fetch_image_b64(osm)
 
 
+def _bearing_deg(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Initial compass bearing in degrees (0=N, 90=E) from point 1 toward point 2."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lng2 - lng1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def _street_view_b64(lat: float, lng: float) -> str:
+    """Street View image aimed AT the building. By default the API snaps to the nearest panorama
+    and uses an arbitrary heading (which often shows down the street or the wrong side). We look
+    up the nearest outdoor panorama's real position (free metadata endpoint) and point the camera
+    from there toward the building point. Falls back to the plain request if metadata is missing.
+    Note: if the only nearby panorama sits behind the building, even a correct heading shows the
+    rear — the live Street View link in the report is the reliable way to pan to the entrance."""
+    if not GOOGLE_API_KEY or lat is None or lng is None:
+        return ""
+    meta = _get("https://maps.googleapis.com/maps/api/streetview/metadata",
+                params={"location": f"{lat},{lng}", "source": "outdoor",
+                        "key": GOOGLE_API_KEY}, quiet=True)
+    if isinstance(meta, dict) and meta.get("status") == "OK":
+        loc_obj = meta.get("location") or {}
+        plat, plng = loc_obj.get("lat"), loc_obj.get("lng")
+        pano_id = meta.get("pano_id") or meta.get("panoId")
+        if plat is not None and plng is not None:
+            heading = _bearing_deg(plat, plng, lat, lng)
+            where = (f"pano={urllib.parse.quote_plus(str(pano_id))}" if pano_id
+                     else f"location={plat},{plng}")
+            return fetch_image_b64(
+                f"https://maps.googleapis.com/maps/api/streetview?size=640x400&fov=75"
+                f"&{where}&heading={heading:.1f}&pitch=8&source=outdoor"
+                f"&return_error_code=true&key={GOOGLE_API_KEY}") or ""
+    if isinstance(meta, dict) and meta.get("status") in ("ZERO_RESULTS", "NOT_FOUND"):
+        return ""
+    return fetch_image_b64(
+        f"https://maps.googleapis.com/maps/api/streetview?size=640x400&fov=80"
+        f"&location={lat},{lng}&return_error_code=true&key={GOOGLE_API_KEY}") or ""
+
+
 def enrich_imagery(prof: ProviderProfile) -> None:
     used = False
     for a in prof.addresses:
@@ -1400,18 +1517,19 @@ def enrich_imagery(prof: ProviderProfile) -> None:
         if a.lat is None or a.lng is None:
             continue
         a.map_link = f"https://www.openstreetmap.org/?mlat={a.lat}&mlon={a.lng}#map=17/{a.lat}/{a.lng}"
+        # Live, interactive Street View at this point — lets you pan to the correct facade
+        # regardless of which way the static thumbnail happens to face.
+        a.street_view_link = (f"https://www.google.com/maps/@?api=1&map_action=pano"
+                              f"&viewpoint={a.lat},{a.lng}")
         if not a.map_data_uri:
             mb = static_map_b64(a.lat, a.lng)
             if mb:
                 a.map_data_uri = mb
                 used = True
         if GOOGLE_API_KEY and not a.street_view_data_uri:
-            # Pass the address (not raw lat/lng) so Street View tends to face the
-            # premises rather than point off down the street.
-            sv_loc = urllib.parse.quote_plus(a.one_line() or f"{a.lat},{a.lng}")
-            sv = fetch_image_b64(
-                f"https://maps.googleapis.com/maps/api/streetview?size=640x400&fov=80"
-                f"&location={sv_loc}&return_error_code=true&key={GOOGLE_API_KEY}")
+            # Aim from the nearest panorama toward the building rather than letting Street View
+            # default to an arbitrary heading. (Live, pannable link is set above as a backstop.)
+            sv = _street_view_b64(a.lat, a.lng)
             if sv:
                 a.street_view_data_uri = sv
                 used = True
@@ -1787,19 +1905,23 @@ def analyze_website_with_llm(prof: ProviderProfile, page_text: str, image_candid
         "street address. Use only real street addresses for this practice — not a billing/PO-box, "
         "a hospital the doctor merely visits, or another business in the building), "
         '"employer" (named hospital/health system that EMPLOYS the doctor, else null), '
-        '"personal_interests" (a list of short PUBLIC, non-clinical personal facts stated on the '
-        'page that are useful for rapport — hobbies, sports, music, volunteering, languages, '
-        'non-medical interests, e.g. "runs marathons", "plays guitar in a local band"; exclude '
-        "anything sensitive such as health, religion, politics, or family details; [] if none), "
-        '"midlevels" (a list of the practice\'s mid-level clinicians — count ONLY nurse '
+        '"personal_interests" (a list of the doctor\'s PERSONAL hobbies and interests stated on '
+        'the page — e.g. "runs marathons", "enjoys fishing", "plays guitar in a local band", '
+        '"loves to cook", sports, travel, pets, languages spoken, community/volunteer activities; '
+        "do NOT include anything about their medical work, specialties, training, practice "
+        "ownership, awards, or career — only personal-life interests; exclude sensitive items such "
+        "as health, religion, politics, or family private details; [] if none), "
+        '"midlevels" (EVERY mid-level clinician you can find named anywhere on the site\'s '
+        "team / providers / staff / about pages — count ONLY nurse "
         "practitioners and physician assistants — each as {\"name\":..,\"type\":\"NP\" or "
         "\"PA\"}. Nurse practitioners include credentials NP, APRN, FNP, PMHNP, AGPCNP, "
         "AGACNP, WHNP, PNP, NNP, ENP, DNP (map all of these to \"NP\"). Physician assistants "
         "include PA, PA-C, DMSc, DHSc (map all of these to \"PA\"). Do NOT include physicians, "
-        "CNMs, CRNAs, CNSs, RNs, medical assistants, or other staff. [] if the roster is shown "
-        "and there are no NPs/PAs), "
-        '"provider_roster_visible" (true ONLY if the page clearly shows the full list of the '
-        "practice's clinicians so a midlevel count can be trusted; false if you are unsure), "
+        "CNMs, CRNAs, CNSs, RNs, medical assistants, or other staff. List each NP/PA you see "
+        "even if you are unsure the roster is exhaustive. [] only if the roster is shown "
+        "and there are genuinely no NPs/PAs), "
+        '"provider_roster_visible" (true if the page shows the practice\'s clinician/provider '
+        "roster at all; false only if no staff/provider listing is present on the pages read), "
         '"interior_photo_urls" (URLs FROM THE CANDIDATE LIST showing the office interior — '
         "waiting room, reception, exam rooms, facility; [] if none/none provided), "
         '"provider_photo_urls" (list of {"name":.., "url":..} for headshots of the doctor or '
@@ -1904,8 +2026,14 @@ def analyze_website_with_llm(prof: ProviderProfile, page_text: str, image_candid
                 mids.append((str(x.get("name", "")).strip() or "(unnamed)", t))
     roster_visible = bool(data.get("provider_roster_visible"))
     prof.midlevels = mids
-    if roster_visible:
+    if mids:
+        # If we actually found NP/PAs on the site, report them — don't hide a real count behind
+        # an over-cautious "is the roster exhaustive?" check. Completeness only matters for
+        # asserting a confident ZERO.
         prof.midlevel_count = len(mids)
+        prof.midlevel_roster_known = True
+    elif roster_visible:
+        prof.midlevel_count = 0
         prof.midlevel_roster_known = True
     else:
         prof.midlevel_count = None
@@ -2620,10 +2748,10 @@ def compute_fit_score(prof: ProviderProfile) -> None:
     prof.disqualifiers = dq
     if dq:
         prof.fit_score = 0
-        prof.fit_lane = "DEAD"
+        prof.fit_lane = "D"
         return
     prof.fit_score = int(round(total))
-    prof.fit_lane = next((lane for lane, cut in FIT_LANES if prof.fit_score >= cut), "DEAD")
+    prof.fit_lane = next((lane for lane, cut in FIT_LANES if prof.fit_score >= cut), "D")
 
 
 # ----------------------------------------------------------------------------
@@ -2714,10 +2842,12 @@ def research_npi(npi: str, *, cms_uuid: str = "", do_google: bool = True,
     # Resolve the CURRENT practice address before any location-based enrichment, since NPPES
     # address data is often years out of date. Order of authority: an open web search for where
     # the doctor practices now, then the practice website, then a Google listing.
-    if do_web or do_interests:
-        print(f"[{npi}] Open web search (current practice"
-              + (" + interests" if do_interests else "") + ") ...")
-        find_current_info_via_web(prof, want_location=do_web, want_interests=do_interests)
+    if do_web:
+        print(f"[{npi}] Open web search (current practice) ...")
+        find_current_practice_via_web(prof)
+    if do_interests:
+        print(f"[{npi}] Open web search (personal interests) ...")
+        find_personal_interests_via_web(prof)
     if do_google:
         print(f"[{npi}] Google Places ...")
         google_places_enrich(prof)
@@ -2820,7 +2950,7 @@ def write_html(prof: ProviderProfile, outdir: str) -> str:
     .fit{display:flex;align-items:center;gap:18px;border-radius:10px;padding:16px 20px;margin:4px 0 14px;color:#fff}
     .fit .score{font-size:40px;font-weight:700;line-height:1}
     .fit .meta{font-size:13px;opacity:.95}
-    .lane-HOT{background:#c0392b} .lane-WARM{background:#e08e0b} .lane-LATER{background:#5b6b8c} .lane-DEAD{background:#5a5a5a}
+    .lane-A{background:#1e8e3e} .lane-B{background:#f4c20d;color:#3a2f00} .lane-C{background:#e8730c} .lane-D{background:#c0392b}
     .badge{display:inline-block;font-weight:700;letter-spacing:.5px;font-size:13px;padding:3px 10px;border-radius:6px;background:rgba(255,255,255,.22)}
     .bar{background:#eef1f7;border-radius:5px;height:14px;position:relative;min-width:120px}
     .bar>span{position:absolute;left:0;top:0;bottom:0;background:#3a5a99;border-radius:5px}
@@ -2903,11 +3033,11 @@ def write_html(prof: ProviderProfile, outdir: str) -> str:
 
     # ---- Concierge Fit ----
     if prof.fit_score is not None:
-        lane = prof.fit_lane or "DEAD"
+        lane = prof.fit_lane or "D"
         P.append(f"<div class='fit lane-{_esc(lane)}'>")
         P.append(f"<div><div class='score'>{prof.fit_score}</div>"
                  f"<div class='meta'>Concierge Fit / 100</div></div>")
-        P.append(f"<div><span class='badge'>{_esc(lane)}</span>"
+        P.append(f"<div><span class='badge'>{_esc(lane)} LEAD</span>"
                  f"<div class='meta'>Specialty: {_esc(prof.specialty_fit_tier or 'unknown')} · "
                  f"Employment: {_esc(prof.employment_status or 'unknown')} · "
                  f"Group size: {_esc(prof.group_size if prof.group_size is not None else '—')}</div></div>")
@@ -3062,19 +3192,22 @@ def write_html(prof: ProviderProfile, outdir: str) -> str:
             P.append("</table>")
         imgs = []
         for u in a.photo_data_uris:
-            imgs.append((u, "Office photo (Google)"))
+            imgs.append((u, "Office photo (Google)", None))
         if a.street_view_data_uri:
-            imgs.append((a.street_view_data_uri, "Street View"))
+            imgs.append((a.street_view_data_uri, "Street View (approx — click to pan)",
+                         a.street_view_link or None))
         if a.satellite_data_uri:
-            imgs.append((a.satellite_data_uri, "Aerial view"))
+            imgs.append((a.satellite_data_uri, "Aerial view", None))
         if a.map_data_uri:
-            imgs.append((a.map_data_uri, "Location map"))
+            imgs.append((a.map_data_uri, "Location map", None))
         if imgs:
             P.append("<div class='imgs'>")
-            for src, cap in imgs:
+            for src, cap, link in imgs:
+                cap_html = (f"<a href='{_esc(link)}' target='_blank'>{_esc(cap)} &#8599;</a>"
+                            if link else _esc(cap))
                 P.append(f"<figure><a href='{src}' target='_blank'>"
                          f"<img src='{src}' alt='{_esc(cap)}'></a>"
-                         f"<figcaption>{_esc(cap)}</figcaption></figure>")
+                         f"<figcaption>{cap_html}</figcaption></figure>")
             P.append("</div>")
         elif a.map_link:
             P.append(f"<p class='note'>Map: <a href='{_esc(a.map_link)}' target='_blank'>view location on OpenStreetMap</a></p>")
@@ -3158,19 +3291,30 @@ def write_html(prof: ProviderProfile, outdir: str) -> str:
                  "provider's website / public pages.</p>")
 
     if prof.personal_interests:
-        P.append("<h2>Personal interests &amp; rapport</h2>"
-                 "<p class='note'>Publicly shared, non-clinical details for outreach — verify "
-                 "before referencing.</p><ul>")
+        # Prose write-up (not a terse bullet list): a flowing paragraph of background + rapport
+        # context, with any cited source links collected at the end.
+        sentences, links = [], []
         for it in prof.personal_interests:
+            t = (it.get("text") or "").strip()
+            if not t:
+                continue
+            t = t[0].upper() + t[1:]
+            if t[-1] not in ".!?":
+                t += "."
+            sentences.append(_esc(t))
             src = (it.get("source") or "").strip()
-            if src.startswith("http"):
-                tail = f" <span class='note'>(<a href='{_esc(src)}' target='_blank'>source</a>)</span>"
-            elif src:
-                tail = f" <span class='note'>({_esc(src)})</span>"
-            else:
-                tail = ""
-            P.append(f"<li>{_esc(it.get('text',''))}{tail}</li>")
-        P.append("</ul>")
+            if src.startswith("http") and src not in links:
+                links.append(src)
+        para = " ".join(sentences)
+        srctail = ""
+        if links:
+            srctail = ("<div class='note' style='margin-top:6px'>Sources: "
+                       + " · ".join(f"<a href='{_esc(u)}' target='_blank'>[{i+1}]</a>"
+                                    for i, u in enumerate(links)) + "</div>")
+        P.append("<h2>Personal interests &amp; rapport</h2>"
+                 "<p class='note'>Publicly shared personal hobbies & interests for outreach — "
+                 "verify before referencing.</p>"
+                 f"<p>{para}</p>{srctail}")
 
     if prof.notes:
         P.append("<h2>Notes &amp; data gaps</h2><ul class='note'>")
@@ -3202,8 +3346,8 @@ def open_in_chrome(path: str) -> None:
 # ----------------------------------------------------------------------------
 # Batch mode
 # ----------------------------------------------------------------------------
-_LANE_FILL = {"HOT": "C0392B", "WARM": "E08E0B", "LATER": "5B6B8C", "DEAD": "7A7A7A"}
-_LANE_ORDER = {"HOT": 0, "WARM": 1, "LATER": 2, "DEAD": 3, "": 4}
+_LANE_FILL = {"A": "1E8E3E", "B": "E0B00B", "C": "E8730C", "D": "C0392B"}
+_LANE_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3, "": 4}
 
 
 def _read_npis(csv_path: str) -> list[str]:
@@ -3340,10 +3484,11 @@ def run_batch(csv_path: str, *, do_google=True, do_scrape=True, do_aggregators=T
                     key=lambda p: (_LANE_ORDER.get(p.fit_lane, 4), -(p.fit_score or 0)))
     print(f"\n[batch] Wrote ranked workbook: {out_xlsx}", file=sys.stderr)
     print(f"[batch] Per-doctor reports: {outdir}", file=sys.stderr)
-    hot = [p for p in profiles if p.fit_lane == "HOT"]
-    warm = [p for p in profiles if p.fit_lane == "WARM"]
-    print(f"[batch] HOT: {len(hot)} · WARM: {len(warm)} · "
-          f"DEAD: {len([p for p in profiles if p.fit_lane=='DEAD'])}", file=sys.stderr)
+    a_ct = len([p for p in profiles if p.fit_lane == "A"])
+    b_ct = len([p for p in profiles if p.fit_lane == "B"])
+    c_ct = len([p for p in profiles if p.fit_lane == "C"])
+    d_ct = len([p for p in profiles if p.fit_lane == "D"])
+    print(f"[batch] A: {a_ct} · B: {b_ct} · C: {c_ct} · D: {d_ct}", file=sys.stderr)
     if push_monday:
         print("[batch] Pushing to monday.com ...", file=sys.stderr)
         push_to_monday(profiles, board_id=monday_board, group_id=monday_group)
